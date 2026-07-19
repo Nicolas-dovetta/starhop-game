@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="theme-color" content="#0a0a1f" />
+<title>Starhop</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    overflow: hidden;
+    background: #05050f;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  #game {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+
+  // ---- Virtual resolution (game logic runs in these units) ----
+  const VW = 400;          // virtual width
+  let VH = 700;            // virtual height (recomputed to match aspect)
+  let scale = 1, offsetX = 0, offsetY = 0;
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+    canvas.style.width = w + "px";
+    canvas.style.height = h + "px";
+    // Keep virtual width fixed, adapt virtual height to the screen aspect.
+    VH = VW * (h / w);
+    scale = (w * dpr) / VW;
+    offsetX = 0;
+    offsetY = 0;
+    ctx.setTransform(scale, 0, 0, scale, offsetX, offsetY);
+  }
+  window.addEventListener("resize", resize);
+
+  // ---- Game constants ----
+  const GRAVITY = 1400;      // px/s^2
+  const FLAP = -430;         // px/s
+  const PLAYER_X = VW * 0.30;
+  const PLAYER_R = 16;
+  const GATE_W = 62;
+  const GATE_GAP = 190;
+  const GATE_SPACING = 260;  // horizontal distance between gates
+  const SPEED = 190;         // world scroll speed px/s
+
+  // ---- State ----
+  const STATE = { MENU: 0, PLAYING: 1, DEAD: 2 };
+  let state = STATE.MENU;
+
+  let player, gates, particles, stars, score, best, shake, spawnX, deathTimer, tPrev;
+
+  best = parseInt(localStorage.getItem("starhop_best") || "0", 10);
+
+  function reset() {
+    player = { y: VH * 0.42, vy: 0, rot: 0 };
+    gates = [];
+    particles = [];
+    score = 0;
+    shake = 0;
+    deathTimer = 0;
+    spawnX = VW + 120;
+    for (let i = 0; i < 3; i++) { spawnGate(spawnX); spawnX += GATE_SPACING; }
+    initStars();
+  }
+
+  function spawnGate(x) {
+    const margin = 90;
+    const gapY = margin + Math.random() * (VH - GATE_GAP - margin * 2) + GATE_GAP / 2;
+    gates.push({ x, gapY, passed: false, hue: 180 + Math.random() * 120 });
+  }
+
+  // ---- Parallax starfield ----
+  function initStars() {
+    stars = [];
+    for (let i = 0; i < 70; i++) {
+      stars.push({
+        x: Math.random() * VW,
+        y: Math.random() * VH,
+        z: 0.2 + Math.random() * 0.8,
+        r: Math.random() * 1.6 + 0.3
+      });
+    }
+  }
+
+  // ---- Audio (WebAudio, no assets) ----
+  let actx = null;
+  function audio() {
+    if (!actx) {
+      try { actx = new (window.AudioContext || window.webkitAudioContext)(); }
+      catch (e) { actx = null; }
+    }
+    return actx;
+  }
+  function beep(freq, dur, type = "sine", vol = 0.12, slideTo = null) {
+    const a = audio();
+    if (!a) return;
+    const o = a.createOscillator();
+    const g = a.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination);
+    o.start(); o.stop(a.currentTime + dur);
+  }
+  const sndFlap  = () => beep(520, 0.10, "square", 0.06, 700);
+  const sndScore = () => beep(660, 0.12, "triangle", 0.10, 990);
+  const sndCrash = () => beep(160, 0.35, "sawtooth", 0.16, 40);
+
+  // ---- Particles ----
+  function burst(x, y, hue, n, spd) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const s = Math.random() * spd;
+      particles.push({
+        x, y,
+        vx: Math.cos(a) * s,
+        vy: Math.sin(a) * s,
+        life: 1, hue
+      });
+    }
+  }
+
+  // ---- Input ----
+  function flap() {
+    audio();
+    if (state === STATE.MENU) {
+      state = STATE.PLAYING;
+      player.vy = FLAP;
+      sndFlap();
+    } else if (state === STATE.PLAYING) {
+      player.vy = FLAP;
+      player.rot = -0.5;
+      burst(PLAYER_X - 10, player.y + 6, 190, 6, 90);
+      sndFlap();
+    } else if (state === STATE.DEAD && deathTimer > 0.6) {
+      reset();
+      state = STATE.MENU;
+    }
+  }
+  window.addEventListener("pointerdown", (e) => { e.preventDefault(); flap(); }, { passive: false });
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Space" || e.code === "ArrowUp" || e.code === "KeyW") {
+      e.preventDefault(); flap();
+    }
+  });
+
+  // ---- Collision ----
+  function hitGate(g) {
+    const withinX = PLAYER_X + PLAYER_R > g.x && PLAYER_X - PLAYER_R < g.x + GATE_W;
+    if (!withinX) return false;
+    const topEdge = g.gapY - GATE_GAP / 2;
+    const botEdge = g.gapY + GATE_GAP / 2;
+    return player.y - PLAYER_R < topEdge || player.y + PLAYER_R > botEdge;
+  }
+
+  function die() {
+    state = STATE.DEAD;
+    deathTimer = 0;
+    shake = 16;
+    burst(PLAYER_X, player.y, 15, 40, 260);
+    sndCrash();
+    if (score > best) { best = score; localStorage.setItem("starhop_best", String(best)); }
+  }
+
+  // ---- Update ----
+  function update(dt) {
+    // Stars drift regardless of state
+    for (const s of stars) {
+      s.x -= SPEED * s.z * dt * (state === STATE.PLAYING ? 1 : 0.25);
+      if (s.x < -2) { s.x = VW + 2; s.y = Math.random() * VH; }
+    }
+
+    if (state === STATE.PLAYING) {
+      player.vy += GRAVITY * dt;
+      player.y += player.vy * dt;
+      player.rot += (Math.min(Math.max(player.vy / 600, -0.6), 1.4) - player.rot) * Math.min(1, dt * 10);
+
+      for (const g of gates) {
+        g.x -= SPEED * dt;
+        if (!g.passed && g.x + GATE_W < PLAYER_X - PLAYER_R) {
+          g.passed = true;
+          score++;
+          sndScore();
+          burst(PLAYER_X, player.y, g.hue, 10, 120);
+        }
+        if (hitGate(g)) die();
+      }
+
+      // recycle / spawn gates
+      if (gates.length && gates[0].x + GATE_W < -20) gates.shift();
+      const lastX = gates.length ? gates[gates.length - 1].x : PLAYER_X;
+      if (lastX < VW - GATE_SPACING + 40) spawnGate(lastX + GATE_SPACING);
+
+      // floor / ceiling
+      if (player.y + PLAYER_R > VH - 4 || player.y - PLAYER_R < 0) {
+        player.y = Math.min(Math.max(player.y, PLAYER_R), VH - 4 - PLAYER_R);
+        die();
+      }
+    } else if (state === STATE.DEAD) {
+      deathTimer += dt;
+      player.vy += GRAVITY * dt;
+      player.y = Math.min(player.y + player.vy * dt, VH - 4 - PLAYER_R);
+    }
+
+    // particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vy += 300 * dt;
+      p.life -= dt * 1.6;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    if (shake > 0) shake = Math.max(0, shake - dt * 60);
+  }
+
+  // ---- Render ----
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function draw() {
+    ctx.setTransform(scale, 0, 0, scale, offsetX, offsetY);
+    // background gradient
+    const g = ctx.createLinearGradient(0, 0, 0, VH);
+    g.addColorStop(0, "#0a0a24");
+    g.addColorStop(0.6, "#0b0730");
+    g.addColorStop(1, "#140a2e");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, VW, VH);
+
+    // screen shake
+    if (shake > 0) {
+      ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    }
+
+    // stars
+    for (const s of stars) {
+      ctx.globalAlpha = 0.4 + s.z * 0.6;
+      ctx.fillStyle = "#dfe8ff";
+      ctx.fillRect(s.x, s.y, s.r, s.r);
+    }
+    ctx.globalAlpha = 1;
+
+    // gates
+    for (const gt of gates) {
+      const top = gt.gapY - GATE_GAP / 2;
+      const bot = gt.gapY + GATE_GAP / 2;
+      const col = `hsl(${gt.hue}, 90%, 60%)`;
+      ctx.save();
+      ctx.shadowColor = col;
+      ctx.shadowBlur = 18;
+      ctx.fillStyle = col;
+      roundRect(gt.x, 0, GATE_W, top, 10); ctx.fill();
+      roundRect(gt.x, bot, GATE_W, VH - bot, 10); ctx.fill();
+      ctx.restore();
+      // inner darker core
+      ctx.fillStyle = "rgba(5,5,20,0.35)";
+      roundRect(gt.x + 6, 6, GATE_W - 12, Math.max(0, top - 12), 6); ctx.fill();
+      roundRect(gt.x + 6, bot + 6, GATE_W - 12, Math.max(0, VH - bot - 12), 6); ctx.fill();
+    }
+
+    // particles
+    for (const p of particles) {
+      ctx.globalAlpha = Math.max(0, p.life);
+      ctx.fillStyle = `hsl(${p.hue}, 90%, 65%)`;
+      const sz = 3 * p.life + 1;
+      ctx.fillRect(p.x - sz / 2, p.y - sz / 2, sz, sz);
+    }
+    ctx.globalAlpha = 1;
+
+    // player (little rocket orb)
+    ctx.save();
+    ctx.translate(PLAYER_X, player.y);
+    ctx.rotate(player.rot);
+    ctx.shadowColor = "#57d5ff";
+    ctx.shadowBlur = 20;
+    const pg = ctx.createRadialGradient(-4, -4, 2, 0, 0, PLAYER_R);
+    pg.addColorStop(0, "#e8faff");
+    pg.addColorStop(0.5, "#57d5ff");
+    pg.addColorStop(1, "#2b7bd6");
+    ctx.fillStyle = pg;
+    ctx.beginPath();
+    ctx.arc(0, 0, PLAYER_R, 0, Math.PI * 2);
+    ctx.fill();
+    // thruster flame
+    if (state === STATE.PLAYING) {
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = "rgba(255,180,80,0.9)";
+      ctx.beginPath();
+      ctx.moveTo(-PLAYER_R + 2, 0);
+      ctx.lineTo(-PLAYER_R - 8 - Math.random() * 6, -5);
+      ctx.lineTo(-PLAYER_R - 8 - Math.random() * 6, 5);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // reset shake translate for HUD
+    ctx.setTransform(scale, 0, 0, scale, offsetX, offsetY);
+
+    // HUD score
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "center";
+    ctx.font = "700 64px -apple-system, sans-serif";
+    ctx.shadowColor = "#57d5ff"; ctx.shadowBlur = 12;
+    if (state === STATE.PLAYING) ctx.fillText(String(score), VW / 2, 90);
+    ctx.shadowBlur = 0;
+
+    if (state === STATE.MENU) {
+      panel();
+      ctx.fillStyle = "#fff";
+      ctx.font = "800 56px -apple-system, sans-serif";
+      ctx.fillText("STARHOP", VW / 2, VH * 0.40);
+      ctx.font = "500 20px -apple-system, sans-serif";
+      ctx.fillStyle = "#9fb0d8";
+      ctx.fillText("Tap / Space to hop", VW / 2, VH * 0.40 + 40);
+      ctx.fillText("Fly through the gates", VW / 2, VH * 0.40 + 68);
+      ctx.fillStyle = "#ffd479";
+      ctx.font = "600 20px -apple-system, sans-serif";
+      ctx.fillText("Best: " + best, VW / 2, VH * 0.40 + 110);
+      pulseHint();
+    } else if (state === STATE.DEAD) {
+      panel();
+      ctx.fillStyle = "#fff";
+      ctx.font = "800 44px -apple-system, sans-serif";
+      ctx.fillText("GAME OVER", VW / 2, VH * 0.38);
+      ctx.font = "600 30px -apple-system, sans-serif";
+      ctx.fillText("Score: " + score, VW / 2, VH * 0.38 + 50);
+      ctx.fillStyle = "#ffd479";
+      ctx.font = "600 22px -apple-system, sans-serif";
+      ctx.fillText("Best: " + best, VW / 2, VH * 0.38 + 84);
+      if (deathTimer > 0.6) {
+        ctx.fillStyle = "#9fb0d8";
+        ctx.font = "500 20px -apple-system, sans-serif";
+        ctx.fillText("Tap to play again", VW / 2, VH * 0.38 + 130);
+      }
+    }
+  }
+
+  function panel() {
+    ctx.fillStyle = "rgba(5,6,24,0.55)";
+    roundRect(VW * 0.10, VH * 0.24, VW * 0.80, VH * 0.34, 18);
+    ctx.fill();
+  }
+  let hintT = 0;
+  function pulseHint() {
+    hintT += 0.05;
+    ctx.globalAlpha = 0.5 + Math.sin(hintT) * 0.4;
+    ctx.fillStyle = "#57d5ff";
+    ctx.beginPath();
+    ctx.arc(VW / 2, VH * 0.66, 26, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#05050f";
+    ctx.font = "700 22px -apple-system, sans-serif";
+    ctx.fillText("▲", VW / 2, VH * 0.66 + 8);
+  }
+
+  // ---- Loop ----
+  function frame(t) {
+    if (!tPrev) tPrev = t;
+    let dt = (t - tPrev) / 1000;
+    tPrev = t;
+    dt = Math.min(dt, 0.033); // clamp
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  resize();
+  reset();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
